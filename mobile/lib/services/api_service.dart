@@ -17,10 +17,19 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
+class _TransientGoogleResponse implements Exception {
+  final String message;
+  final int? statusCode;
+
+  const _TransientGoogleResponse(this.message, [this.statusCode]);
+}
+
 class ApiService {
   static const _storage = FlutterSecureStorage();
   static const _tokenKey = 'workspace_session_token';
   static const _deviceKey = 'workspace_bound_device_id';
+  static const _maxTransportAttempts = 4;
+  static const _maxRedirectHops = 5;
 
   Uri get _endpoint {
     if (!AppConfig.hasValidScriptUrl) {
@@ -127,51 +136,200 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> _post(Map<String, dynamic> payload) async {
-    http.Response response;
-    try {
-      response = await http
-          .post(
-            _endpoint,
-            headers: const {'Content-Type': 'application/json; charset=utf-8'},
-            body: jsonEncode(payload),
-          )
-          .timeout(const Duration(seconds: 25));
-    } on TimeoutException {
-      throw ApiException('انتهت مهلة الاتصال بخدمة Google. تحقق من الإنترنت ثم حاول مرة أخرى.');
-    } on http.ClientException {
-      throw ApiException('تعذر الاتصال بخدمة Google. تحقق من الإنترنت ورابط Apps Script.');
+    final action = payload['action']?.toString() ?? 'unknown';
+    _TransientGoogleResponse? lastTransient;
+
+    for (var attempt = 1; attempt <= _maxTransportAttempts; attempt++) {
+      try {
+        final response = await _sendToAppsScript(payload);
+
+        if (_isTransientStatus(response.statusCode)) {
+          throw _TransientGoogleResponse(
+            'HTTP ${response.statusCode}',
+            response.statusCode,
+          );
+        }
+
+        if (response.statusCode < 200 || response.statusCode >= 400) {
+          throw ApiException(
+            'تعذر الوصول إلى خدمة الحضور (${response.statusCode}).',
+            response.statusCode,
+          );
+        }
+
+        final data = _decode(response);
+        if (data['ok'] != true) {
+          final code = data['code']?.toString();
+          final status = code == 'UNAUTHORIZED' ? 401 : null;
+          throw ApiException(_errorMessage(data), status, code);
+        }
+        return data;
+      } on _TransientGoogleResponse catch (e) {
+        lastTransient = e;
+        if (attempt == _maxTransportAttempts) break;
+        await Future<void>.delayed(Duration(milliseconds: 1200 * attempt));
+      } on TimeoutException {
+        lastTransient = const _TransientGoogleResponse('timeout');
+        if (attempt == _maxTransportAttempts) break;
+        await Future<void>.delayed(Duration(milliseconds: 1200 * attempt));
+      } on http.ClientException {
+        lastTransient = const _TransientGoogleResponse('network error');
+        if (attempt == _maxTransportAttempts) break;
+        await Future<void>.delayed(Duration(milliseconds: 1200 * attempt));
+      }
     }
 
-    if (response.statusCode < 200 || response.statusCode >= 400) {
-      throw ApiException('تعذر الوصول إلى خدمة الحضور (${response.statusCode}).', response.statusCode);
-    }
-
-    final data = _decode(response);
-    if (data['ok'] != true) {
-      final code = data['code']?.toString();
-      final status = code == 'UNAUTHORIZED' ? 401 : null;
-      throw ApiException(_errorMessage(data), status, code);
-    }
-    return data;
+    final statusText = lastTransient?.statusCode == null
+        ? ''
+        : ' HTTP ${lastTransient!.statusCode}.';
+    throw ApiException(
+      'تعذر استلام استجابة صالحة من Google Apps Script بعد عدة محاولات.'
+      '$statusText المرحلة: $action. حاول مرة أخرى بعد لحظات.',
+      lastTransient?.statusCode,
+      'GOOGLE_RESPONSE_INVALID',
+    );
   }
 
+  Future<http.Response> _sendToAppsScript(Map<String, dynamic> payload) async {
+    final client = http.Client();
+    try {
+      var response = await _sendRequest(
+        client,
+        method: 'POST',
+        uri: _endpoint,
+        body: jsonEncode(payload),
+      );
+
+      var hops = 0;
+      while (_isRedirectStatus(response.statusCode)) {
+        hops++;
+        if (hops > _maxRedirectHops) {
+          throw const _TransientGoogleResponse('redirect limit exceeded');
+        }
+
+        final location = response.headers['location'];
+        if (location == null || location.isEmpty) {
+          throw _TransientGoogleResponse(
+            'redirect without location',
+            response.statusCode,
+          );
+        }
+
+        final baseUri = response.request?.url ?? _endpoint;
+        final nextUri = baseUri.resolve(location);
+        if (!_isTrustedGoogleUri(nextUri)) {
+          throw ApiException('تم رفض إعادة توجيه غير موثوقة من خدمة Google.');
+        }
+
+        // Google ContentService normally redirects POST results to a one-time
+        // script.googleusercontent.com URL. A redirect back to /exec is a
+        // transient bounce-loop and should be retried from the start.
+        if (_isAppsScriptExecUri(nextUri)) {
+          throw _TransientGoogleResponse(
+            'redirect bounced back to /exec',
+            response.statusCode,
+          );
+        }
+
+        response = await _sendRequest(
+          client,
+          method: 'GET',
+          uri: nextUri,
+        );
+      }
+
+      return response;
+    } finally {
+      client.close();
+    }
+  }
+
+  Future<http.Response> _sendRequest(
+    http.Client client, {
+    required String method,
+    required Uri uri,
+    String? body,
+  }) async {
+    final request = http.Request(method, uri)
+      ..followRedirects = false
+      ..headers['Accept'] = 'application/json';
+
+    if (body != null) {
+      request.headers['Content-Type'] = 'application/json; charset=utf-8';
+      request.body = body;
+    }
+
+    final streamed = await client
+        .send(request)
+        .timeout(const Duration(seconds: 20));
+    return http.Response.fromStream(streamed).timeout(const Duration(seconds: 20));
+  }
+
+  bool _isRedirectStatus(int statusCode) =>
+      statusCode == 301 ||
+      statusCode == 302 ||
+      statusCode == 303 ||
+      statusCode == 307 ||
+      statusCode == 308;
+
+  bool _isTransientStatus(int statusCode) =>
+      statusCode == 404 ||
+      statusCode == 405 ||
+      statusCode == 408 ||
+      statusCode == 425 ||
+      statusCode == 429 ||
+      statusCode == 500 ||
+      statusCode == 502 ||
+      statusCode == 503 ||
+      statusCode == 504;
+
+  bool _isTrustedGoogleUri(Uri uri) {
+    if (uri.scheme != 'https') return false;
+    return uri.host == 'script.googleusercontent.com' ||
+        uri.host == 'script.google.com';
+  }
+
+  bool _isAppsScriptExecUri(Uri uri) =>
+      uri.host == 'script.google.com' &&
+      uri.path.contains('/macros/s/') &&
+      uri.path.endsWith('/exec');
+
   Map<String, dynamic> _decode(http.Response response) {
+    var bodyText = response.body;
+    if (bodyText.startsWith('\uFEFF')) {
+      bodyText = bodyText.substring(1);
+    }
+    final trimmed = bodyText.trim();
     final contentType = response.headers['content-type'] ?? '';
-    final trimmed = response.body.trimLeft();
+
+    if (trimmed.isEmpty) {
+      throw _TransientGoogleResponse(
+        'empty response body',
+        response.statusCode,
+      );
+    }
+
     if (contentType.contains('text/html') ||
         trimmed.startsWith('<!DOCTYPE') ||
         trimmed.startsWith('<html')) {
-      throw ApiException(
-        'الرابط المستخدم لا يرجع JSON من Google Apps Script. تأكد من استخدام رابط النشر المنتهي بـ /exec.',
+      throw _TransientGoogleResponse(
+        'HTML returned instead of JSON',
+        response.statusCode,
       );
     }
 
     try {
-      final body = jsonDecode(response.body);
+      final body = jsonDecode(trimmed);
       if (body is Map<String, dynamic>) return body;
-      throw const FormatException('Unexpected JSON type');
-    } catch (_) {
-      throw ApiException('استجابة غير صالحة من خدمة الحضور.');
+      throw _TransientGoogleResponse(
+        'unexpected JSON type',
+        response.statusCode,
+      );
+    } on FormatException {
+      throw _TransientGoogleResponse(
+        'invalid JSON response',
+        response.statusCode,
+      );
     }
   }
 
