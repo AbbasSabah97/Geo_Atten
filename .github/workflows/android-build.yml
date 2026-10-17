@@ -3,10 +3,9 @@ name: Build Android APK
 on:
   workflow_dispatch:
     inputs:
-      api_base_url:
-        description: 'Backend base URL, e.g. https://attendance.example.com'
+      google_script_url:
+        description: 'Deployed Google Apps Script URL ending with /exec'
         required: true
-        default: 'https://example.com'
   push:
     branches: [ main ]
     paths:
@@ -51,26 +50,35 @@ jobs:
       - name: Run tests
         run: flutter test
 
-      - name: Resolve API URL
-        id: api
+      - name: Resolve Google Apps Script URL
+        id: endpoint
         shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            URL="${{ inputs.api_base_url }}"
+            URL="${{ inputs.google_script_url }}"
           else
-            URL="${{ vars.API_BASE_URL }}"
+            URL="${{ vars.GOOGLE_SCRIPT_URL }}"
           fi
+
           if [ -z "$URL" ]; then
-            URL="https://example.com"
+            echo "GOOGLE_SCRIPT_URL is not configured."
+            exit 1
           fi
+
+          if [[ ! "$URL" =~ ^https://script\.google\.com/macros/s/.+/exec$ ]]; then
+            echo "Invalid Google Apps Script URL. It must start with https://script.google.com/macros/s/ and end with /exec"
+            exit 1
+          fi
+
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
       - name: Build release APK
-        run: flutter build apk --release --dart-define=API_BASE_URL=${{ steps.api.outputs.url }}
+        run: flutter build apk --release --dart-define=GOOGLE_SCRIPT_URL="${{ steps.endpoint.outputs.url }}"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: geo-attendance-apk
+          name: geo-attendance-google-workspace-apk
           path: mobile/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
+          retention-days: 14
