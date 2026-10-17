@@ -35,19 +35,32 @@ class LocationService {
       throw Exception('يجب تفعيل الموقع الدقيق Precise Location لتسجيل الحضور.');
     }
 
-    final position = await Geolocator.getCurrentPosition(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.best,
-        timeLimit: Duration(seconds: 20),
-      ),
-    );
+    Position? best;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: LocationSettings(
+          accuracy: LocationAccuracy.bestForNavigation,
+          timeLimit: Duration(seconds: attempt == 0 ? 18 : 10),
+        ),
+      );
 
-    if (position.isMocked) {
-      throw Exception('تم اكتشاف موقع وهمي Mock Location. تم رفض العملية.');
+      if (position.isMocked) {
+        throw Exception('تم اكتشاف موقع وهمي Mock Location. تم رفض العملية.');
+      }
+
+      if (best == null || position.accuracy < best.accuracy) {
+        best = position;
+      }
+
+      if (best.accuracy <= 15) break;
+    }
+
+    if (best == null) {
+      throw Exception('تعذر الحصول على الموقع. حاول مرة أخرى في مكان مفتوح.');
     }
 
     return LocationCheckResult(
-      position: position,
+      position: best,
       accuracyStatus: accuracyStatus,
     );
   }
