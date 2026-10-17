@@ -5,7 +5,7 @@ class AppConfig {
   );
 
   static const String appName = 'Geo Attendance';
-  static const String appVersion = '0.2.0';
+  static const String appVersion = '0.2.1';
 
   static bool get hasValidScriptUrl {
     final uri = Uri.tryParse(googleScriptUrl);
