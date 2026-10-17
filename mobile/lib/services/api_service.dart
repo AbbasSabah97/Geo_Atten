@@ -121,7 +121,7 @@ class ApiService {
       'session_token': token,
       'device_id': deviceId,
       'app_version': AppConfig.appVersion,
-      if (extra != null) ...extra,
+      ...?extra,
     };
     return _post(payload);
   }
